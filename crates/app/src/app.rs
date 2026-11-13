@@ -77,6 +77,13 @@ pub struct App {
     status: String,
     new_dialog: Option<NewDialog>,
     path: Option<PathBuf>,
+    /// Directory of the last file opened/saved; file dialogs start here.
+    last_dir: Option<PathBuf>,
+    /// Most recently loaded/saved files, newest first. Persisted across restarts.
+    recent: Vec<PathBuf>,
+    /// The image as last loaded or saved; the title shows `*` when `img` differs.
+    saved: Image,
+    title: String,
 }
 
 impl App {
@@ -107,6 +114,10 @@ impl App {
             status: "Ready".into(),
             new_dialog: None,
             path: None,
+            last_dir: None,
+            recent: vec![],
+            saved: Image::new(Mode::Multicolor, 40, 25),
+            title: String::new(),
         }
     }
 
@@ -120,7 +131,24 @@ impl App {
         self.sort.order(&self.pal())
     }
 
+    /// Load persisted state (the recent-files list).
+    pub fn restore(&mut self, storage: Option<&dyn eframe::Storage>) {
+        if let Some(text) = storage.and_then(|s| s.get_string(RECENT_KEY)) {
+            self.recent = text.lines().filter(|l| !l.is_empty()).map(PathBuf::from).take(MAX_RECENT).collect();
+        }
+        if self.last_dir.is_none() {
+            self.last_dir = self.recent.first().and_then(|p| p.parent()).map(Path::to_path_buf);
+        }
+    }
+
+    fn add_recent(&mut self, path: &Path) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(MAX_RECENT);
+    }
+
     fn set_image(&mut self, img: Image, path: Option<PathBuf>) {
+        self.saved = img.clone();
         self.img = img;
         self.undo.clear();
         self.redo.clear();
@@ -249,13 +277,34 @@ impl App {
 
     // ---- file operations ----
 
+    /// A file dialog that starts in the most recently used directory.
+    fn dialog(&self) -> rfd::FileDialog {
+        let d = rfd::FileDialog::new();
+        match &self.last_dir {
+            Some(dir) => d.set_directory(dir),
+            None => d,
+        }
+    }
+
+    fn remember_dir(&mut self, path: &Path) {
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            self.last_dir = Some(dir.to_path_buf());
+        }
+    }
+
     fn open_file(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
+        let Some(path) = self
+            .dialog()
             .add_filter("C64 / CursedPaint", &["rpnt", "koa", "kla", "art", "aas", "ocp"])
             .pick_file()
         else {
             return;
         };
+        self.load_path(path);
+    }
+
+    fn load_path(&mut self, path: PathBuf) {
+        self.remember_dir(&path);
         let result = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|data| {
             let ext = ext_of(&path);
             match ext.as_str() {
@@ -268,26 +317,39 @@ impl App {
         });
         match result {
             Ok(img) => {
-                let is_project = ext_of(&path) == "rpnt";
                 self.status = format!("Opened {}", path.display());
-                self.set_image(img, if is_project { Some(path) } else { None });
+                self.add_recent(&path);
+                self.set_image(img, Some(path));
             }
-            Err(e) => self.status = format!("Open failed: {e}"),
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+                self.recent.retain(|p| p != &path);
+            }
         }
     }
 
     fn save_project_as(&mut self) {
-        let Some(path) = rfd::FileDialog::new().add_filter("CursedPaint project", &["rpnt"]).set_file_name("untitled.rpnt").save_file()
+        let Some(path) = self.dialog().add_filter("CursedPaint project", &["rpnt"]).set_file_name("untitled.rpnt").save_file()
         else {
             return;
         };
+        self.remember_dir(&path);
         self.write(path.with_extension("rpnt"), io::save_project(&self.img), true);
     }
 
-    fn save_project(&mut self) {
-        match self.path.clone() {
-            Some(p) => self.write(p, io::save_project(&self.img), true),
-            None => self.save_project_as(),
+    /// Save to the current file in the format it was opened/saved in.
+    fn save(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return self.save_project_as();
+        };
+        let bytes = match ext_of(&path).as_str() {
+            "koa" | "kla" => io::save_koala(&self.img).map_err(|e| e.to_string()),
+            "art" | "aas" | "ocp" => io::save_art_studio(&self.img).map_err(|e| e.to_string()),
+            _ => Ok(io::save_project(&self.img)),
+        };
+        match bytes {
+            Ok(b) => self.write(path, b, true),
+            Err(e) => self.status = format!("Save failed: {e}"),
         }
     }
 
@@ -305,11 +367,13 @@ impl App {
         match result {
             Err(e) => self.status = format!("Export failed: {e}"),
             Ok(bytes) => {
-                if let Some(path) = rfd::FileDialog::new()
+                if let Some(path) = self
+                    .dialog()
                     .add_filter(filter, &[ext])
                     .set_file_name(format!("picture.{ext}"))
                     .save_file()
                 {
+                    self.remember_dir(&path);
                     self.write(path, bytes, false);
                 }
             }
@@ -321,11 +385,23 @@ impl App {
             Ok(()) => {
                 self.status = format!("Saved {}", path.display());
                 if is_project {
+                    self.add_recent(&path);
                     self.path = Some(path);
+                    self.saved = self.img.clone();
                 }
             }
             Err(e) => self.status = format!("Save failed: {e}"),
         }
+    }
+
+    fn window_title(&self) -> String {
+        let name = self
+            .path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or_else(|| "Untitled".to_string(), |n| n.to_string_lossy().into_owned());
+        let star = if self.img != self.saved { "*" } else { "" };
+        format!("{name}{star} - CursedPaint")
     }
 
     // ---- UI pieces ----
@@ -341,9 +417,30 @@ impl App {
                     ui.close();
                     self.open_file();
                 }
-                if ui.button("Save project").clicked() {
+                let mut pick = None;
+                ui.add_enabled_ui(!self.recent.is_empty(), |ui| {
+                    ui.menu_button("Open recent", |ui| {
+                        for p in &self.recent {
+                            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+                            if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
+                                pick = Some(p.clone());
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear recent files").clicked() {
+                            self.recent.clear();
+                            ui.close();
+                        }
+                    });
+                });
+                if let Some(p) = pick {
                     ui.close();
-                    self.save_project();
+                    self.load_path(p);
+                }
+                if ui.button("Save").clicked() {
+                    ui.close();
+                    self.save();
                 }
                 if ui.button("Save project as…").clicked() {
                     ui.close();
@@ -440,8 +537,8 @@ impl App {
             if icons::button(ui, Icon::Open, false, true, S, "Open… (Cmd+O)").clicked() {
                 self.open_file();
             }
-            if icons::button(ui, Icon::Save, false, true, S, "Save project (Cmd+S)").clicked() {
-                self.save_project();
+            if icons::button(ui, Icon::Save, false, true, S, "Save (Cmd+S)").clicked() {
+                self.save();
             }
             ui.add_space(6.0);
             ui.separator();
@@ -859,7 +956,7 @@ impl App {
             self.do_undo();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
-            self.save_project();
+            self.save();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.open_file();
@@ -981,13 +1078,26 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+const RECENT_KEY: &str = "recent_files";
+const MAX_RECENT: usize = 10;
+
 fn ext_of(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
 }
 
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let text: Vec<String> = self.recent.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        storage.set_string(RECENT_KEY, text.join("\n"));
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
+        let title = self.window_title();
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
+        }
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             self.menu(ui);
             ui.add_space(2.0);
@@ -1244,5 +1354,32 @@ mod tests {
         stroke(&mut app, PointerButton::Primary, (0, 0), (0, 0));
         assert_eq!(app.fg, 9);
         assert_eq!(app.undo.len(), 1); // picking is not an undoable edit
+    }
+
+    #[test]
+    fn recent_files_dedupe_and_cap() {
+        let mut app = App::new(&egui::Context::default());
+        for i in 0..15 {
+            app.add_recent(Path::new(&format!("/tmp/f{i}.rpnt")));
+        }
+        app.add_recent(Path::new("/tmp/f10.rpnt"));
+        assert_eq!(app.recent.len(), MAX_RECENT);
+        assert_eq!(app.recent[0], PathBuf::from("/tmp/f10.rpnt"));
+        assert_eq!(app.recent.iter().filter(|p| p.ends_with("f10.rpnt")).count(), 1);
+    }
+
+    #[test]
+    fn save_keeps_original_format() {
+        let dir = std::env::temp_dir().join(format!("cp_save_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(&egui::Context::default());
+        let koa = dir.join("a.koa");
+        std::fs::write(&koa, io::save_koala(&app.img).unwrap()).unwrap();
+        app.load_path(koa.clone());
+        assert_eq!(app.path.as_deref(), Some(koa.as_path()));
+        app.save();
+        let data = std::fs::read(&koa).unwrap();
+        assert!(io::load_koala(&data).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

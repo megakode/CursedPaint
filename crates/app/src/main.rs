@@ -11,6 +11,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "CursedPaint",
         options,
-        Box::new(|cc| Ok(Box::new(app::App::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            let mut app = app::App::new(&cc.egui_ctx);
+            app.restore(cc.storage);
+            Ok(Box::new(app))
+        }),
     )
 }
