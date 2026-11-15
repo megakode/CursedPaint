@@ -14,6 +14,7 @@ pub enum Icon {
     EllipseFill,
     Fill,
     Picker,
+    Select,
     New,
     Open,
     Save,
@@ -71,6 +72,10 @@ pub fn paint(p: &Painter, area: Rect, icon: Icon, c: Color32) {
             p.line_segment([pt(0.16, 0.84), pt(0.52, 0.48)], Stroke::new(w * 1.5, c));
             poly(vec![pt(0.46, 0.34), pt(0.66, 0.54), pt(0.76, 0.44), pt(0.56, 0.24)], c, Stroke::NONE);
             poly(vec![pt(0.60, 0.18), pt(0.82, 0.40), pt(0.90, 0.32), pt(0.68, 0.10)], c, Stroke::NONE);
+        }
+        Icon::Select => {
+            let c4 = [pt(0.14, 0.18), pt(0.86, 0.18), pt(0.86, 0.82), pt(0.14, 0.82), pt(0.14, 0.18)];
+            p.extend(Shape::dashed_line(&c4, st, s * 0.12, s * 0.08));
         }
         Icon::New => {
             path(vec![pt(0.24, 0.10), pt(0.58, 0.10), pt(0.80, 0.32), pt(0.80, 0.90), pt(0.24, 0.90), pt(0.24, 0.10)]);

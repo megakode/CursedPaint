@@ -56,6 +56,13 @@ Cmd+S, Cmd+O. Right-click paints the second colour.
 Import/export: open `.rpnt`, `.koa/.kla` (Koala), `.art/.aas/.ocp` (Art Studio); export Koala (multicolor,
 40x25 only), Art Studio (hires, 40x25 only), KickAssembler `.asm`. Project save is `.rpnt`.
 
+CRT preview (View > CRT preview): a floating window that runs a RetroArch slang preset (`.slangp`)
+over the picture via `librashader`'s OpenGL runtime (`crates/app/src/crt.rs`). Presets are not bundled;
+get them from libretro/slang-shaders and pick one with "Load preset…" (remembered across restarts).
+librashader needs glow 0.17 while eframe has 0.16, so `main.rs` builds a second glow context from the
+same GL loader. The input texture must have mipmaps or librashader's samplers sample black.
+`cursedpaint FILE` opens a file at startup. Test headlessly with `xvfb-run` (llvmpipe works).
+
 ## Not built yet (ideas, roughly in the order discussed)
 
 - Sprite modes (standard/multicolor sprites, 24x21 units) and sprite animation; charset/tilemap editing

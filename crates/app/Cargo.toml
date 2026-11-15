@@ -9,3 +9,7 @@ c64gfx = { path = "../c64gfx" }
 eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11"] }
 rfd = "0.15"
 winit = { version = "0.30", features = ["wayland-csd-adwaita"] }
+librashader = { version = "0.12", default-features = false, features = ["runtime-gl", "presets", "preprocess"] }
+# librashader's GL runtime uses glow 0.17 while eframe 0.32 uses 0.16, so we build our own
+# glow 0.17 context from the same GL loader.
+glow17 = { package = "glow", version = "0.17" }

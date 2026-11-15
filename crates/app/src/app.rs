@@ -16,9 +16,10 @@ enum Tool {
     EllipseFill,
     Fill,
     Picker,
+    Select,
 }
 
-const TOOLS: [(Tool, Icon, &str, &str, Key); 8] = [
+const TOOLS: [(Tool, Icon, &str, &str, Key); 9] = [
     (Tool::Pencil, Icon::Pencil, "Pencil", "B", Key::B),
     (Tool::Line, Icon::Line, "Line", "L", Key::L),
     (Tool::Rect, Icon::Rect, "Rectangle", "R", Key::R),
@@ -27,7 +28,24 @@ const TOOLS: [(Tool, Icon, &str, &str, Key); 8] = [
     (Tool::EllipseFill, Icon::EllipseFill, "Filled ellipse", "Shift+E", Key::Y),
     (Tool::Fill, Icon::Fill, "Fill", "G", Key::G),
     (Tool::Picker, Icon::Picker, "Colour picker", "I", Key::I),
+    (Tool::Select, Icon::Select, "Select / move", "M", Key::M),
 ];
+
+/// Marks a transparent (outside the image) pixel in a lifted selection.
+const CLEAR: u8 = 255;
+
+/// A selection being dragged: the lifted pixels (visible colours) and where they are now.
+struct Lift {
+    buf: Vec<u8>,
+    w: i32,
+    h: i32,
+    /// Top-left of the selection when it was lifted.
+    src: (i32, i32),
+    /// Current displacement from `src`.
+    off: (i32, i32),
+    /// Alt-drag: leave the original in place.
+    copy: bool,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColorMode {
@@ -73,6 +91,10 @@ pub struct App {
     cell_grid: bool,
     pixel_grid: bool,
     drag: Option<Drag>,
+    /// Rectangular selection (inclusive x0, y0, x1, y1) in logical pixels.
+    sel: Option<(i32, i32, i32, i32)>,
+    lift: Option<Lift>,
+    copy_on_move: bool,
     hover_cell: Option<(usize, usize)>,
     status: String,
     new_dialog: Option<NewDialog>,
@@ -84,6 +106,9 @@ pub struct App {
     /// The image as last loaded or saved; the title shows `*` when `img` differs.
     saved: Image,
     title: String,
+    crt: Option<crate::crt::CrtPreview>,
+    crt_open: bool,
+    crt_stale: bool,
 }
 
 impl App {
@@ -110,6 +135,9 @@ impl App {
             cell_grid: false,
             pixel_grid: false,
             drag: None,
+            sel: None,
+            lift: None,
+            copy_on_move: false,
             hover_cell: Some((0, 0)),
             status: "Ready".into(),
             new_dialog: None,
@@ -118,6 +146,9 @@ impl App {
             recent: vec![],
             saved: Image::new(Mode::Multicolor, 40, 25),
             title: String::new(),
+            crt: None,
+            crt_open: false,
+            crt_stale: true,
         }
     }
 
@@ -132,7 +163,18 @@ impl App {
     }
 
     /// Load persisted state (the recent-files list).
+    /// Enable the CRT preview (needs an OpenGL context to run shaders in).
+    pub fn set_crt(&mut self, crt: crate::crt::CrtPreview) {
+        self.crt = Some(crt);
+    }
+
     pub fn restore(&mut self, storage: Option<&dyn eframe::Storage>) {
+        self.crt_open = self.crt.is_some() && storage.and_then(|s| s.get_string(CRT_OPEN_KEY)).as_deref() == Some("1");
+        if let (Some(crt), Some(p)) = (&mut self.crt, storage.and_then(|s| s.get_string(CRT_KEY))) {
+            if Path::new(&p).is_file() {
+                crt.set_preset(PathBuf::from(p));
+            }
+        }
         if let Some(text) = storage.and_then(|s| s.get_string(RECENT_KEY)) {
             self.recent = text.lines().filter(|l| !l.is_empty()).map(PathBuf::from).take(MAX_RECENT).collect();
         }
@@ -260,6 +302,77 @@ impl App {
         };
     }
 
+    /// Select tool: follow the pointer while dragging (resize the marquee or move the lift).
+    fn select_update(&mut self, d: &Drag) {
+        if let Some(l) = &mut self.lift {
+            l.off = (d.last.0 - d.start.0, d.last.1 - d.start.1);
+            let (x, y) = (l.src.0 + l.off.0, l.src.1 + l.off.1);
+            self.sel = Some((x, y, x + l.w - 1, y + l.h - 1));
+        } else {
+            let (w, h) = (self.img.width() as i32 - 1, self.img.height() as i32 - 1);
+            let c = |v: i32, m: i32| v.clamp(0, m);
+            self.sel = Some((
+                c(d.start.0.min(d.last.0), w),
+                c(d.start.1.min(d.last.1), h),
+                c(d.start.0.max(d.last.0), w),
+                c(d.start.1.max(d.last.1), h),
+            ));
+        }
+    }
+
+    /// Select tool: finish the drag. A moved selection is stamped at its new place.
+    fn select_release(&mut self, d: &mut Drag) {
+        let Some(l) = self.lift.take() else {
+            if d.start == d.last {
+                self.sel = None;
+            }
+            return;
+        };
+        if !l.copy && l.off == (0, 0) {
+            self.img = d.before.clone();
+            self.dirty = true;
+            return;
+        }
+        let pal = self.pal();
+        for iy in 0..l.h {
+            for ix in 0..l.w {
+                let c = l.buf[(iy * l.w + ix) as usize];
+                if c == CLEAR {
+                    continue;
+                }
+                let (x, y) = (l.src.0 + l.off.0 + ix, l.src.1 + l.off.1 + iy);
+                match self.img.paint_auto(x, y, c, self.force, &pal) {
+                    PaintOutcome::Nearest => d.nearest += 1,
+                    PaintOutcome::Forced => d.forced += 1,
+                    _ => {}
+                }
+            }
+        }
+        self.dirty = true;
+        // keep the selection on the image
+        let (w, h) = (self.img.width() as i32 - 1, self.img.height() as i32 - 1);
+        self.sel = self.sel.and_then(|(x0, y0, x1, y1)| {
+            let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(w), y1.min(h));
+            (x0 <= x1 && y0 <= y1).then_some((x0, y0, x1, y1))
+        });
+    }
+
+    /// Erase the selected pixels (undoable).
+    fn clear_selection(&mut self) {
+        let Some((x0, y0, x1, y1)) = self.sel else { return };
+        let before = self.img.clone();
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                self.img.set_code(x, y, 0);
+            }
+        }
+        if self.img != before {
+            self.undo.push(before);
+            self.redo.clear();
+            self.dirty = true;
+        }
+    }
+
     fn shape_points(&self, a: (i32, i32), b: (i32, i32)) -> Vec<(i32, i32)> {
         match self.tool {
             Tool::Line => shapes::line(a, b),
@@ -300,6 +413,11 @@ impl App {
         else {
             return;
         };
+        self.load_path(path);
+    }
+
+    /// Open a file given on the command line.
+    pub fn open_path(&mut self, path: PathBuf) {
         self.load_path(path);
     }
 
@@ -474,6 +592,9 @@ impl App {
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.cell_grid, "Cell grid");
                 ui.checkbox(&mut self.pixel_grid, "Pixel grid");
+                if self.crt.is_some() && ui.checkbox(&mut self.crt_open, "CRT preview").changed() {
+                    self.crt_stale = true;
+                }
                 if ui.button("Fit to window").clicked() {
                     self.fit_next = true;
                     ui.close();
@@ -709,6 +830,7 @@ impl App {
             None => self.tex = Some(ctx.load_texture("canvas", image, TextureOptions::NEAREST)),
         }
         self.dirty = false;
+        self.crt_stale = true;
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -732,6 +854,9 @@ impl App {
 
         let hovered = resp.hovered();
         let ctx = ui.ctx().clone();
+        if self.tool != Tool::Select && self.drag.is_none() {
+            self.sel = None;
+        }
 
         // zoom around the cursor
         if hovered {
@@ -775,6 +900,7 @@ impl App {
                 let released = ctx.input(|i| i.pointer.button_released(button));
 
                 if pressed && hovered && self.drag.is_none() && !space {
+                    self.copy_on_move = ctx.input(|i| i.modifiers.alt);
                     if let Some(pos) = cur {
                         self.begin(button, secondary, pos);
                     }
@@ -792,10 +918,16 @@ impl App {
                             d.last = pos;
                         } else if self.is_shape_tool() {
                             d.last = pos;
+                        } else if self.tool == Tool::Select {
+                            d.last = pos;
+                            self.select_update(&d);
                         }
                     }
                 }
                 if released || !down {
+                    if self.tool == Tool::Select {
+                        self.select_release(&mut d);
+                    }
                     if self.is_shape_tool() {
                         let pts = self.shape_points(d.start, d.last);
                         self.put_all(&pts, secondary, &mut d);
@@ -844,6 +976,40 @@ impl App {
                     painter.rect_filled(r, 0.0, col);
                 }
             }
+        }
+        if let Some(l) = &self.lift {
+            let pal = self.pal();
+            for iy in 0..l.h {
+                for ix in 0..l.w {
+                    let c = l.buf[(iy * l.w + ix) as usize];
+                    if c == CLEAR {
+                        continue;
+                    }
+                    let (x, y) = (l.src.0 + l.off.0 + ix, l.src.1 + l.off.1 + iy);
+                    let [r, g, b] = pal.rgb[c as usize];
+                    let cell = Rect::from_min_size(origin + Vec2::new(x as f32 * px_w, y as f32 * px_h), Vec2::new(px_w, px_h));
+                    painter.rect_filled(cell, 0.0, Color32::from_rgb(r, g, b));
+                }
+            }
+        }
+        if let Some((x0, y0, x1, y1)) = self.sel {
+            let r = Rect::from_min_max(
+                origin + Vec2::new(x0 as f32 * px_w, y0 as f32 * px_h),
+                origin + Vec2::new((x1 + 1) as f32 * px_w, (y1 + 1) as f32 * px_h),
+            );
+            painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0_f32, Color32::BLACK), egui::StrokeKind::Outside);
+            let corners = [r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+            painter.extend(egui::Shape::dashed_line(&corners, egui::Stroke::new(1.0_f32, Color32::WHITE), 4.0, 4.0));
+            if hovered && !space {
+                if let Some((x, y)) = cur {
+                    if x >= x0 && x <= x1 && y >= y0 && y <= y1 {
+                        ctx.set_cursor_icon(egui::CursorIcon::Move);
+                    }
+                }
+            }
+        }
+        if self.tool == Tool::Select && hovered && !space && self.sel.is_none() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         // Floating brush: the pixels the next click would paint, in the active colour.
         let shape_drag = self.drag.is_some() && self.tool != Tool::Pencil;
@@ -905,6 +1071,9 @@ impl App {
     /// Pixels a click at `pos` would paint right now (brush footprint, minus dithered-out
     /// cells, clipped to the image). Used for the floating brush preview.
     fn hover_preview_points(&self, pos: (i32, i32)) -> Vec<(i32, i32)> {
+        if self.tool == Tool::Select {
+            return vec![];
+        }
         let mode = self.img.mode;
         let (w, h) = (self.img.width() as i32, self.img.height() as i32);
         let stamped = self.brush > 0 && matches!(self.tool, Tool::Pencil | Tool::Line | Tool::Rect | Tool::Ellipse);
@@ -929,6 +1098,34 @@ impl App {
                 let pts = self.img.region_at(pos.0, pos.1);
                 self.put_all(&pts, secondary, &mut d);
                 self.finish(d);
+            }
+            Tool::Select => {
+                if secondary {
+                    return;
+                }
+                match self.sel {
+                    Some((x0, y0, x1, y1)) if pos.0 >= x0 && pos.0 <= x1 && pos.1 >= y0 && pos.1 <= y1 => {
+                        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+                        let mut buf = Vec::with_capacity((w * h) as usize);
+                        for y in y0..=y1 {
+                            for x in x0..=x1 {
+                                buf.push(self.img.color_at(x, y).unwrap_or(CLEAR));
+                            }
+                        }
+                        let copy = self.copy_on_move;
+                        if !copy {
+                            for y in y0..=y1 {
+                                for x in x0..=x1 {
+                                    self.img.set_code(x, y, 0);
+                                }
+                            }
+                            self.dirty = true;
+                        }
+                        self.lift = Some(Lift { buf, w, h, src: (x0, y0), off: (0, 0), copy });
+                    }
+                    _ => self.sel = None,
+                }
+                self.drag = Some(d);
             }
             Tool::Picker => {
                 if let Some(c) = self.img.color_at(pos.0, pos.1) {
@@ -994,6 +1191,72 @@ impl App {
             }
             if ctx.input(|i| i.key_pressed(Key::F)) {
                 self.fit_next = true;
+            }
+            if self.tool == Tool::Select && self.drag.is_none() {
+                if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    self.sel = None;
+                }
+                if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                    self.clear_selection();
+                }
+            }
+        }
+    }
+
+    /// The floating CRT preview window: the picture run through a RetroArch slang preset.
+    fn crt_ui(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if !self.crt_open {
+            return;
+        }
+        let Some(crt) = &mut self.crt else { return };
+        if self.crt_stale || crt.needs_load() {
+            let (w, h, rgba) = self.img.to_rgba(&PALETTES[0]);
+            crt.render(frame, w, h, &rgba);
+            self.crt_stale = false;
+        }
+        let mut pick = false;
+        let mut open = true;
+        egui::Window::new("CRT preview").open(&mut open).default_size([660.0, 540.0]).resizable(true).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                pick = ui.button("Load preset…").on_hover_text("Choose a RetroArch .slangp shader preset").clicked();
+                match &crt.preset {
+                    Some(p) => ui.label(p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()),
+                    None => ui.label("no preset loaded"),
+                };
+            });
+            if let Some(e) = &crt.error {
+                ui.colored_label(Color32::LIGHT_RED, e);
+            }
+            match crt.texture_id().filter(|_| crt.has_chain()) {
+                Some(id) => {
+                    let w = ui.available_width().max(64.0);
+                    let size = Vec2::new(w, w * 0.75);
+                    ui.image(egui::load::SizedTexture::new(id, size));
+                }
+                None if crt.preset.is_none() => {
+                    ui.label("Pick a .slangp preset (e.g. from libretro/slang-shaders, crt/…).");
+                }
+                None => {}
+            }
+        });
+        self.crt_open = open;
+        if pick {
+            let start = self
+                .crt
+                .as_ref()
+                .and_then(|c| c.preset.as_ref())
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/retroarch/shaders")))
+                .filter(|d| d.is_dir());
+            let mut dlg = rfd::FileDialog::new().add_filter("Slang shader preset", &["slangp"]);
+            if let Some(d) = start {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(path) = dlg.pick_file() {
+                if let Some(c) = &mut self.crt {
+                    c.set_preset(path);
+                }
+                self.crt_stale = true;
             }
         }
     }
@@ -1078,6 +1341,8 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+const CRT_OPEN_KEY: &str = "crt_open";
+const CRT_KEY: &str = "crt_preset";
 const RECENT_KEY: &str = "recent_files";
 const MAX_RECENT: usize = 10;
 
@@ -1089,9 +1354,13 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         let text: Vec<String> = self.recent.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         storage.set_string(RECENT_KEY, text.join("\n"));
+        storage.set_string(CRT_OPEN_KEY, if self.crt_open { "1" } else { "0" }.into());
+        if let Some(p) = self.crt.as_ref().and_then(|c| c.preset.as_ref()) {
+            storage.set_string(CRT_KEY, p.to_string_lossy().into_owned());
+        }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.shortcuts(ctx);
         let title = self.window_title();
         if title != self.title {
@@ -1133,6 +1402,7 @@ impl eframe::App for App {
         });
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| self.canvas(ui));
         self.new_dialog_ui(ctx);
+        self.crt_ui(ctx, frame);
     }
 }
 
@@ -1153,8 +1423,36 @@ mod tests {
                 let pts = app.shape_points(d.start, d.last);
                 app.put_all(&pts, secondary, &mut d);
             }
+            if app.tool == Tool::Select {
+                app.select_update(&d);
+                app.select_release(&mut d);
+            }
             app.finish(d);
         }
+    }
+
+    #[test]
+    fn select_move_and_undo() {
+        let mut app = App::new(&egui::Context::default());
+        app.fg = 2;
+        stroke(&mut app, PointerButton::Primary, (1, 1), (2, 1));
+        app.undo.clear();
+        app.tool = Tool::Select;
+        stroke(&mut app, PointerButton::Primary, (0, 0), (3, 3)); // marquee
+        assert_eq!(app.sel, Some((0, 0, 3, 3)));
+        app.begin(PointerButton::Primary, false, (1, 1));
+        let mut d = app.drag.take().unwrap();
+        d.last = (11, 11);
+        app.select_update(&d);
+        app.select_release(&mut d);
+        app.finish(d);
+        assert_eq!(app.img.color_at(1, 1), Some(0));
+        assert_eq!(app.img.color_at(11, 11), Some(2));
+        assert_eq!(app.sel, Some((10, 10, 13, 13)));
+        assert_eq!(app.undo.len(), 1);
+        app.do_undo();
+        assert_eq!(app.img.color_at(1, 1), Some(2));
+        assert_eq!(app.img.color_at(11, 11), Some(0));
     }
 
     #[test]
