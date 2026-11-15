@@ -44,6 +44,15 @@ impl CrtPreview {
         self.error = None;
     }
 
+    /// Forget everything the shaders remember between frames (afterglow, feedback, history)
+    /// by rebuilding the filter chain from the current preset on the next render.
+    pub fn reset(&mut self) {
+        self.frames = 0;
+        if self.preset.is_some() && self.pending_preset.is_none() {
+            self.pending_preset = self.preset.clone();
+        }
+    }
+
     pub fn has_chain(&self) -> bool {
         self.chain.is_some()
     }

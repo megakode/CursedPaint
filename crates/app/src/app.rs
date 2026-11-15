@@ -191,6 +191,9 @@ impl App {
 
     fn set_image(&mut self, img: Image, path: Option<PathBuf>) {
         self.saved = img.clone();
+        if let Some(crt) = &mut self.crt {
+            crt.reset();
+        }
         self.img = img;
         self.undo.clear();
         self.redo.clear();
@@ -210,6 +213,11 @@ impl App {
     /// Select the previous (-1) or next (+1) preset brush, wrapping around.
     fn step_brush(&mut self, delta: i32) {
         self.brush = (self.brush as i32 + delta).rem_euclid(brush::COUNT as i32) as usize;
+    }
+
+    /// Select the previous (-1) or next (+1) dither pattern, wrapping around.
+    fn step_dither(&mut self, delta: i32) {
+        self.dither.index = (self.dither.index as i32 + delta).rem_euclid(c64gfx::dither::COUNT as i32) as usize;
     }
 
     fn do_undo(&mut self) {
@@ -736,6 +744,7 @@ impl App {
                 }
             }
         });
+        ui.small("; ' = previous / next dither");
     }
 
     fn side_panel(&mut self, ui: &mut egui::Ui) {
@@ -1186,6 +1195,12 @@ impl App {
             if ctx.input(|i| i.key_pressed(Key::CloseBracket)) {
                 self.step_color(1);
             }
+            if ctx.input(|i| i.key_pressed(Key::Semicolon)) {
+                self.step_dither(-1);
+            }
+            if ctx.input(|i| i.key_pressed(Key::Quote)) {
+                self.step_dither(1);
+            }
             if ctx.input(|i| i.key_pressed(Key::X)) {
                 std::mem::swap(&mut self.fg, &mut self.bg);
             }
@@ -1601,6 +1616,15 @@ mod tests {
         assert_eq!(app.brush, brush::COUNT - 1);
         app.step_brush(1);
         assert_eq!(app.brush, 0);
+    }
+
+    #[test]
+    fn step_dither_wraps() {
+        let mut app = App::new(&egui::Context::default());
+        app.step_dither(-1);
+        assert_eq!(app.dither.index, c64gfx::dither::COUNT - 1);
+        app.step_dither(1);
+        assert_eq!(app.dither.index, 0);
     }
 
     #[test]
