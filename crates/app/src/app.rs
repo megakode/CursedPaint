@@ -94,7 +94,11 @@ pub struct App {
     /// Rectangular selection (inclusive x0, y0, x1, y1) in logical pixels.
     sel: Option<(i32, i32, i32, i32)>,
     lift: Option<Lift>,
+    /// Copied pixels (visible colours, `CLEAR` = transparent) and their size.
+    clipboard: Option<(Vec<u8>, i32, i32)>,
     copy_on_move: bool,
+    /// Just pasted: the next drag of the selection moves a copy and leaves the original.
+    fresh_paste: bool,
     hover_cell: Option<(usize, usize)>,
     status: String,
     new_dialog: Option<NewDialog>,
@@ -137,7 +141,9 @@ impl App {
             drag: None,
             sel: None,
             lift: None,
+            clipboard: None,
             copy_on_move: false,
+            fresh_paste: false,
             hover_cell: Some((0, 0)),
             status: "Ready".into(),
             new_dialog: None,
@@ -363,6 +369,60 @@ impl App {
             let (x0, y0, x1, y1) = (x0.max(0), y0.max(0), x1.min(w), y1.min(h));
             (x0 <= x1 && y0 <= y1).then_some((x0, y0, x1, y1))
         });
+    }
+
+    /// Copy the selected pixels to the internal clipboard.
+    fn copy_selection(&mut self) -> bool {
+        let Some((x0, y0, x1, y1)) = self.sel else { return false };
+        let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut buf = Vec::with_capacity((w * h) as usize);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                buf.push(self.img.color_at(x, y).unwrap_or(CLEAR));
+            }
+        }
+        self.clipboard = Some((buf, w, h));
+        self.status = "Copied selection".into();
+        true
+    }
+
+    /// Paste the clipboard at the selection's top-left (or the image's), and select it.
+    fn paste(&mut self) {
+        let Some((buf, w, h)) = self.clipboard.clone() else { return };
+        let (ox, oy) = self.sel.map_or((0, 0), |(x0, y0, _, _)| (x0, y0));
+        let before = self.img.clone();
+        let pal = self.pal();
+        let (mut nearest, mut forced) = (0, 0);
+        for iy in 0..h {
+            for ix in 0..w {
+                let c = buf[(iy * w + ix) as usize];
+                if c == CLEAR {
+                    continue;
+                }
+                match self.img.paint_auto(ox + ix, oy + iy, c, self.force, &pal) {
+                    PaintOutcome::Nearest => nearest += 1,
+                    PaintOutcome::Forced => forced += 1,
+                    _ => {}
+                }
+            }
+        }
+        let (iw, ih) = (self.img.width() as i32 - 1, self.img.height() as i32 - 1);
+        let (x1, y1) = ((ox + w - 1).min(iw), (oy + h - 1).min(ih));
+        self.sel = (ox <= x1 && oy <= y1).then_some((ox, oy, x1, y1));
+        self.tool = Tool::Select;
+        self.fresh_paste = true;
+        if self.img != before {
+            self.undo.push(before);
+            self.redo.clear();
+            self.dirty = true;
+        }
+        self.status = if nearest > 0 {
+            format!("{nearest} pixel(s) could not fit the cell's colour limit; nearest colour used")
+        } else if forced > 0 {
+            format!("{forced} pixel(s) forced: other pixels in the cell changed colour")
+        } else {
+            "Pasted".into()
+        };
     }
 
     /// Erase the selected pixels (undoable).
@@ -594,6 +654,23 @@ impl App {
                 }
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo")).clicked() {
                     self.do_redo();
+                    ui.close();
+                }
+                ui.separator();
+                let has_sel = self.sel.is_some();
+                if ui.add_enabled(has_sel, egui::Button::new("Cut").shortcut_text("Ctrl+X")).clicked() {
+                    if self.copy_selection() {
+                        self.clear_selection();
+                        self.status = "Cut selection".into();
+                    }
+                    ui.close();
+                }
+                if ui.add_enabled(has_sel, egui::Button::new("Copy").shortcut_text("Ctrl+C")).clicked() {
+                    self.copy_selection();
+                    ui.close();
+                }
+                if ui.add_enabled(self.clipboard.is_some(), egui::Button::new("Paste").shortcut_text("Ctrl+V")).clicked() {
+                    self.paste();
                     ui.close();
                 }
             });
@@ -1112,6 +1189,7 @@ impl App {
                 if secondary {
                     return;
                 }
+                let was_fresh = std::mem::take(&mut self.fresh_paste);
                 match self.sel {
                     Some((x0, y0, x1, y1)) if pos.0 >= x0 && pos.0 <= x1 && pos.1 >= y0 && pos.1 <= y1 => {
                         let (w, h) = (x1 - x0 + 1, y1 - y0 + 1);
@@ -1121,7 +1199,7 @@ impl App {
                                 buf.push(self.img.color_at(x, y).unwrap_or(CLEAR));
                             }
                         }
-                        let copy = self.copy_on_move;
+                        let copy = self.copy_on_move || was_fresh;
                         if !copy {
                             for y in y0..=y1 {
                                 for x in x0..=x1 {
@@ -1166,6 +1244,27 @@ impl App {
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.open_file();
+        }
+        if self.tool == Tool::Select && self.drag.is_none() {
+            // egui turns Cmd/Ctrl+C/X/V into dedicated events rather than key presses.
+            let (copy, cut) = ctx.input(|i| {
+                (
+                    i.events.iter().any(|e| matches!(e, egui::Event::Copy)),
+                    i.events.iter().any(|e| matches!(e, egui::Event::Cut)),
+                )
+            });
+            if (copy || cut) && self.copy_selection() {
+                // egui-winit only emits Paste when the system clipboard holds text, so put
+                // a placeholder there.
+                ctx.copy_text("CursedPaint selection".into());
+            }
+            if cut && self.clipboard.is_some() {
+                self.clear_selection();
+                self.status = "Cut selection".into();
+            }
+        }
+        if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)))) && self.drag.is_none() {
+            self.paste();
         }
         let plain = ctx.input(|i| !i.modifiers.command && !i.modifiers.alt);
         if plain {
@@ -1444,6 +1543,26 @@ mod tests {
             }
             app.finish(d);
         }
+    }
+
+    #[test]
+    fn copy_paste_selection() {
+        let mut app = App::new(&egui::Context::default());
+        app.fg = 2;
+        stroke(&mut app, PointerButton::Primary, (1, 1), (2, 1));
+        app.tool = Tool::Select;
+        stroke(&mut app, PointerButton::Primary, (0, 0), (3, 3));
+        assert!(app.copy_selection());
+        app.undo.clear();
+        // move the marquee to (10,10) by dragging an empty-less region: just set it directly
+        app.sel = Some((10, 10, 13, 13));
+        app.paste();
+        assert_eq!(app.img.color_at(11, 11), Some(2));
+        assert_eq!(app.img.color_at(1, 1), Some(2), "original stays");
+        assert_eq!(app.sel, Some((10, 10, 13, 13)));
+        assert_eq!(app.undo.len(), 1);
+        app.do_undo();
+        assert_eq!(app.img.color_at(11, 11), Some(0));
     }
 
     #[test]
